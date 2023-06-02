@@ -17,6 +17,8 @@ def collate_data_and_cast(samples_list, mask_ratio_tuple, mask_probability, dtyp
     collated_global_crops = torch.stack([s[0]["global_crops"][i] for i in range(n_global_crops) for s in samples_list])
 
     collated_local_crops = torch.stack([s[0]["local_crops"][i] for i in range(n_local_crops) for s in samples_list])
+    collated_global_crops_msk = torch.stack([s[0]["global_msks"][i] for i in range(n_global_crops) for s in samples_list])
+    
 
     B = len(collated_global_crops)
     N = n_tokens
@@ -42,6 +44,7 @@ def collate_data_and_cast(samples_list, mask_ratio_tuple, mask_probability, dtyp
     return {
         "collated_global_crops": collated_global_crops.to(dtype),
         "collated_local_crops": collated_local_crops.to(dtype),
+        "collated_global_crops_msk":collated_global_crops_msk.long(),
         "collated_masks": collated_masks,
         "mask_indices_list": mask_indices_list,
         "masks_weight": masks_weight,

@@ -56,6 +56,7 @@ class SSLMetaArch(nn.Module):
         self.do_dino = cfg.dino.loss_weight > 0
         self.do_koleo = cfg.dino.koleo_loss_weight > 0
         self.do_ibot = cfg.ibot.loss_weight > 0
+        self.do_multiscale = cfg.multiscale.loss_weight > 0
         self.ibot_separate_head = cfg.ibot.separate_head
 
         logger.info("OPTIONS -- DINO")
@@ -112,7 +113,27 @@ class SSLMetaArch(nn.Module):
                 teacher_model_dict["ibot_head"] = ibot_head()
             else:
                 logger.info("OPTIONS -- IBOT -- head shared with DINO")
-
+        if self.do_multiscale:
+            self.multiscale_loss_weight = cfg.multiscale.loss_weight
+            self.multiscale_loss = iBOTPatchLoss(self.ibot_out_dim)
+            self.multiscale_separate_head = cfg.multiscale.separate_head
+            if self.multiscale_separate_head:
+                logger.info(f"OPTIONS -- MS -- loss_weight: {cfg.ibot.loss_weight}")
+                logger.info(f"OPTIONS -- MS -- head_n_prototypes: {cfg.ibot.head_n_prototypes}")
+                logger.info(f"OPTIONS -- MS -- head_bottleneck_dim: {cfg.ibot.head_bottleneck_dim}")
+                logger.info(f"OPTIONS -- MS -- head_hidden_dim: {cfg.ibot.head_hidden_dim}")
+                ms_head = partial(
+                    DINOHead,
+                    in_dim=embed_dim,
+                    out_dim=cfg.multiscale.head_n_prototypes,
+                    hidden_dim=cfg.multiscale.head_hidden_dim,
+                    bottleneck_dim=cfg.multiscale.head_bottleneck_dim,
+                    nlayers=cfg.multiscale.head_nlayers,
+                )
+                student_model_dict["ms_head"] = ms_head()
+                teacher_model_dict["ms_head"] = ms_head()
+            else:
+                logger.info("OPTIONS -- MS -- head shared with DINO")
         self.need_to_synchronize_fsdp_streams = True
 
         self.student = nn.ModuleDict(student_model_dict)
@@ -132,12 +153,30 @@ class SSLMetaArch(nn.Module):
         else:
             loss.backward()
 
+    def mask_pool(self,src,msk):
+        '''
+        src: N X HW X D
+        msk: N X HW X M
+        '''
+        return torch.einsum('nld,nlm->nmd',src,msk)
+
     def forward_backward(self, images, teacher_temp):
         n_global_crops = 2
         assert n_global_crops == 2
         n_local_crops = self.cfg.crops.local_crops_number
 
         global_crops = images["collated_global_crops"].cuda(non_blocking=True)
+        if self.do_multiscale:
+            global_crops_msk = images["collated_global_crops_msk"].cuda(non_blocking=True)
+            global_crops_msk_one_hot = [torch.nn.functional.one_hot(global_crops_msk[:,i],d**2).flatten(1,2) for i,d in enumerate(self.cfg.crops.spatial_dims)]
+            global_crops_msk_one_hot = torch.cat(global_crops_msk_one_hot,dim=-1).to(global_crops.dtype)
+            gloabal_crops_msk_area = global_crops_msk_one_hot.sum(1,keepdim=True)
+            global_crops_msk_one_hot /= (global_crops_msk_one_hot.sum(1,keepdim=True)+1e-3)
+            # mask select
+            ms_msk_areas_indicator = (gloabal_crops_msk_area > 0).chunk(2)
+            ms_msk_areas_indicator = ms_msk_areas_indicator[0] * ms_msk_areas_indicator[1]
+            ms_msk_areas_indicator *= torch.rand_like(ms_msk_areas_indicator.half()) < self.cfg.multiscale.sample_ratio
+            ms_msk_areas_indicator = ms_msk_areas_indicator.repeat(2,1,1)
         local_crops = images["collated_local_crops"].cuda(non_blocking=True)
 
         masks = images["collated_masks"].cuda(non_blocking=True)
@@ -155,7 +194,7 @@ class SSLMetaArch(nn.Module):
 
         # loss scales
         ibot_loss_scale = 1.0 / n_global_crops
-
+        ms_loss_scale = 1.0 / n_global_crops
         # teacher output
         @torch.no_grad()
         def get_teacher_output():
@@ -168,7 +207,6 @@ class SSLMetaArch(nn.Module):
             ibot_teacher_patch_tokens = teacher_backbone_output_dict["x_norm_patchtokens"]
             _dim = ibot_teacher_patch_tokens.shape[-1]
             n_cls_tokens = teacher_cls_tokens.shape[0]
-
             if do_ibot and not self.ibot_separate_head:
                 buffer_tensor_teacher = ibot_teacher_patch_tokens.new_zeros(upperbound + n_cls_tokens, _dim)
                 buffer_tensor_teacher[:n_cls_tokens].copy_(teacher_cls_tokens)
@@ -199,6 +237,19 @@ class SSLMetaArch(nn.Module):
                 teacher_cls_tokens_after_head = self.teacher.dino_head(teacher_cls_tokens)
                 masked_teacher_ibot_softmaxed_centered = None
 
+
+            multiscale_teacher_softmaxed_centered = None
+            if self.do_multiscale:
+                ibot_teacher_patch_tokens = teacher_backbone_output_dict["x_norm_patchtokens"]
+                multi_scale_teacher = self.mask_pool(ibot_teacher_patch_tokens,global_crops_msk_one_hot.to(ibot_teacher_patch_tokens.dtype))
+                multi_scale_teacher = multi_scale_teacher.chunk(n_global_crops_teacher)
+                multi_scale_teacher = torch.cat([multi_scale_teacher[1],multi_scale_teacher[0]])
+                _dim = multi_scale_teacher.shape[-1]
+                multi_scale_teacher = multi_scale_teacher.reshape(-1,_dim)[ms_msk_areas_indicator.view(-1)]
+                if self.multiscale_separate_head:
+                    multi_scale_teacher = self.teacher.ms_head(multi_scale_teacher)
+                else:
+                    multi_scale_teacher = self.teacher.dino_head(multi_scale_teacher)
             if self.cfg.train.centering == "centering":
                 teacher_dino_softmaxed_centered_list = self.dino_loss.softmax_center_teacher(
                     teacher_cls_tokens_after_head, teacher_temp=teacher_temp
@@ -211,7 +262,11 @@ class SSLMetaArch(nn.Module):
                     )
                     masked_teacher_ibot_softmaxed_centered = masked_teacher_ibot_softmaxed_centered.squeeze(0)
                     self.ibot_patch_loss.update_center(masked_teacher_patch_tokens_after_head[:n_masked_patches])
-
+                if self.do_multiscale:
+                    multiscale_teacher_softmaxed_centered = self.multiscale_loss.softmax_center_teacher(
+                        multi_scale_teacher.unsqueeze(0),teacher_temp=teacher_temp
+                    )
+                    self.multiscale_loss.update_center(multi_scale_teacher)
             elif self.cfg.train.centering == "sinkhorn_knopp":
                 teacher_dino_softmaxed_centered_list = self.dino_loss.sinkhorn_knopp_teacher(
                     teacher_cls_tokens_after_head, teacher_temp=teacher_temp
@@ -223,13 +278,18 @@ class SSLMetaArch(nn.Module):
                         teacher_temp=teacher_temp,
                         n_masked_patches_tensor=n_masked_patches_tensor,
                     )
-
+                if self.do_multiscale:
+                    multiscale_teacher_softmaxed_centered = self.ibot_patch_loss.sinkhorn_knopp_teacher(
+                        multi_scale_teacher,
+                        teacher_temp=teacher_temp,
+                        n_masked_patches_tensor=multi_scale_teacher.shape[0],
+                    )
             else:
                 raise NotImplementedError
 
-            return teacher_dino_softmaxed_centered_list, masked_teacher_ibot_softmaxed_centered
+            return teacher_dino_softmaxed_centered_list, masked_teacher_ibot_softmaxed_centered,multiscale_teacher_softmaxed_centered
 
-        teacher_dino_softmaxed_centered_list, masked_teacher_ibot_softmaxed_centered = get_teacher_output()
+        teacher_dino_softmaxed_centered_list, masked_teacher_ibot_softmaxed_centered,multiscale_teacher_softmaxed_centered = get_teacher_output()
         reshard_fsdp_model(self.teacher)
 
         loss_dict = {}
@@ -264,6 +324,16 @@ class SSLMetaArch(nn.Module):
                     :n_masked_patches
                 ]
 
+        if self.do_multiscale:
+            ibot_student_patch_tokens = student_global_backbone_output_dict["x_norm_patchtokens"]
+            multi_scale_student = self.mask_pool(ibot_student_patch_tokens,global_crops_msk_one_hot)
+            _dim = multi_scale_student.shape[-1]
+            multi_scale_student = multi_scale_student.reshape(-1,_dim)[ms_msk_areas_indicator.view(-1)]
+            if self.multiscale_separate_head:
+                multi_scale_student_after_head = self.student.ms_head(multi_scale_student)
+            else:
+                inputs_for_student_head_list.append(multi_scale_student.unsqueeze(0))
+
         # 2: run
         _attn_bias, cat_inputs = fmha.BlockDiagonalMask.from_tensor_list(inputs_for_student_head_list)
         outputs_list = _attn_bias.split(self.student.dino_head(cat_inputs))
@@ -277,7 +347,8 @@ class SSLMetaArch(nn.Module):
         # 3c: global crops patch tokens
         if do_ibot and not self.ibot_separate_head:
             student_global_masked_patch_tokens_after_head = outputs_list.pop(0).squeeze(0)[:n_masked_patches]
-
+        if self.do_multiscale:
+            multi_scale_student_after_head = outputs_list.pop(0).squeeze(0)
         if n_local_crops > 0:
             dino_local_crops_loss = self.dino_loss(
                 student_output_list=student_local_cls_tokens_after_head.chunk(n_local_crops),
@@ -341,7 +412,28 @@ class SSLMetaArch(nn.Module):
 
             # accumulate loss
             loss_accumulator += self.ibot_loss_weight * ibot_patch_loss
+        if self.do_multiscale:
+            # compute loss
+            ms_mask_weight = 0.5 / (ms_msk_areas_indicator.sum(-1)+1e-3)
+            ms_mask_weight = ms_mask_weight.repeat(1,ms_msk_areas_indicator.shape[-1])
+            ms_mask_weight = ms_mask_weight.view(-1)[ms_msk_areas_indicator.view(-1)]
+            ms_patch_loss = (
+                self.multiscale_loss.forward_masked(
+                    multi_scale_student_after_head,
+                    multiscale_teacher_softmaxed_centered,
+                    student_masks_flat=torch.ones_like(masks),
+                    n_masked_patches=multi_scale_student_after_head.shape[0],
+                    masks_weight=ms_mask_weight,
+                )
+                * loss_scales
+                * ms_loss_scale
+            )
 
+            # store for display
+            loss_dict["ms_loss"] = ms_patch_loss / 2
+
+            # accumulate loss
+            loss_accumulator += self.multiscale_loss_weight * ms_patch_loss
         self.backprop_loss(loss_accumulator)
 
         self.fsdp_synchronize_streams()

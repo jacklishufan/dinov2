@@ -1,0 +1,14 @@
+student:
+  arch: vit_small
+  patch_size: 14
+  block_chunks: 4
+train:
+  dataset_path: ImageNet:split=TRAIN
+  batch_size_per_gpu: 256
+crops:
+  local_crops_size: 98
+optim:
+  epochs: 100
+multiscale:
+  loss_weight: 1.0
+  

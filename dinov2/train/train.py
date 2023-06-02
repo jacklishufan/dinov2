@@ -179,6 +179,8 @@ def do_train(cfg, model, resume=False):
         cfg.crops.local_crops_number,
         global_crops_size=cfg.crops.global_crops_size,
         local_crops_size=cfg.crops.local_crops_size,
+        patch_size=cfg.student.patch_size,
+        spatial_dims=cfg.crops.spatial_dims,
     )
 
     collate_fn = partial(

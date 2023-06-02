@@ -11,3 +11,4 @@ dist/
 *.swp
 
 .vscode/
+output_dir*

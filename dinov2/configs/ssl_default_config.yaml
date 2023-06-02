@@ -111,5 +111,14 @@ crops:
   - 0.32
   global_crops_size: 224
   local_crops_size: 96
+  spatial_dims: [14,6,2]
 evaluation:
   eval_period_iterations: 12500
+multiscale:
+  loss_weight: 0.0
+  separate_head: false
+  head_n_prototypes: 65536
+  sample_ratio: 0.5
+  head_bottleneck_dim: 256
+  head_nlayers: 3
+  head_hidden_dim: 2048

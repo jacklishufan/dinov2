@@ -145,9 +145,10 @@ def add_residual(x, brange, residual, residual_scale_factor, scaling_vector=None
         residual = residual.flatten(1)
         x_plus_residual = torch.index_add(x_flat, 0, brange, residual.to(dtype=x.dtype), alpha=residual_scale_factor)
     else:
-        x_plus_residual = scaled_index_add(
-            x, brange, residual.to(dtype=x.dtype), scaling=scaling_vector, alpha=residual_scale_factor
-        )
+        x_plus_residual = torch.index_add(x, dim=0, source=scaling_vector * residual.to(dtype=x.dtype), index=brange, alpha=residual_scale_factor)
+        #x_plus_residual = scaled_index_add(
+        #     x, brange, residual.to(dtype=x.dtype), scaling=scaling_vector, alpha=residual_scale_factor
+        # )
     return x_plus_residual
 
 
@@ -170,7 +171,9 @@ def get_attn_bias_and_cat(x_list, branges=None):
         attn_bias_cache[all_shapes] = attn_bias
 
     if branges is not None:
-        cat_tensors = index_select_cat([x.flatten(1) for x in x_list], branges).view(1, -1, x_list[0].shape[-1])
+        #breakpoint()
+        cat_tensors = torch.cat([s[i.long()].flatten() for s, i in zip([x.flatten(1) for x in x_list], branges)], dim=0).view(1, -1, x_list[0].shape[-1])
+        #cat_tensors = index_select_cat([x.flatten(1) for x in x_list], branges).view(1, -1, x_list[0].shape[-1])
     else:
         tensors_bs1 = tuple(x.reshape([1, -1, *x.shape[2:]]) for x in x_list)
         cat_tensors = torch.cat(tensors_bs1, dim=1)
