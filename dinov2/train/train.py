@@ -22,7 +22,9 @@ from dinov2.utils.config import setup
 from dinov2.utils.utils import CosineScheduler
 
 from dinov2.train.ssl_meta_arch import SSLMetaArch
-
+import os
+import wandb
+WANDB_ENABLED = not os.environ.get('NO_WANDB')
 
 torch.backends.cuda.matmul.allow_tf32 = True  # PyTorch 1.12 sets this to False by default
 logger = logging.getLogger("dinov2")
@@ -234,7 +236,7 @@ def do_train(cfg, model, resume=False):
             return
 
         # apply schedules
-
+        log_img = iteration % 100 == 0
         lr = lr_schedule[iteration]
         wd = wd_schedule[iteration]
         mom = momentum_schedule[iteration]
@@ -245,7 +247,7 @@ def do_train(cfg, model, resume=False):
         # compute losses
 
         optimizer.zero_grad(set_to_none=True)
-        loss_dict = model.forward_backward(data, teacher_temp=teacher_temp)
+        loss_dict = model.forward_backward(data, teacher_temp=teacher_temp,log_img=log_img)
 
         # clip gradients
 
@@ -275,6 +277,7 @@ def do_train(cfg, model, resume=False):
 
         if math.isnan(sum(loss_dict_reduced.values())):
             logger.info("NaN detected")
+            print(loss_dict_reduced)
             raise AssertionError
         losses_reduced = sum(loss for loss in loss_dict_reduced.values())
 
@@ -299,7 +302,8 @@ def do_train(cfg, model, resume=False):
 
 def main(args):
     cfg = setup(args)
-
+    if distributed.get_global_rank() == 0 and WANDB_ENABLED:
+        wandb.init()
     model = SSLMetaArch(cfg).to(torch.device("cuda"))
     model.prepare_for_distributed_training()
 
@@ -314,7 +318,8 @@ def main(args):
         return do_test(cfg, model, f"manual_{iteration}")
 
     do_train(cfg, model, resume=not args.no_resume)
-
+    if wandb.run is not None:
+        wandb.finish()
 
 if __name__ == "__main__":
     args = get_args_parser(add_help=True).parse_args()

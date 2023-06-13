@@ -5,5 +5,5 @@
 # LICENSE file in the root directory of this source tree.
 
 from .dino_clstoken_loss import DINOLoss
-from .ibot_patch_loss import iBOTPatchLoss
+from .ibot_patch_loss import iBOTPatchLoss,MSLoss
 from .koleo_loss import KoLeoLoss

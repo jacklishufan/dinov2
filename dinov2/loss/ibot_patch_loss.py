@@ -115,6 +115,7 @@ class iBOTPatchLoss(nn.Module):
         s = student_patch_tokens_masked
         # loss = torch.sum(t * F.log_softmax(s / self.student_temp, dim=-1), dim=-1)
         loss = lossfunc(t, s, self.student_temp)
+        assert not torch.isnan(loss.sum())
         if masks_weight is None:
             masks_weight = (
                 (1 / student_masks_flat.sum(-1).clamp(min=1.0))
@@ -150,3 +151,66 @@ class iBOTPatchLoss(nn.Module):
             self.center = self.center * self.center_momentum + _t * (1 - self.center_momentum)
 
             self.updated = True
+
+def bn(x):
+    return (x-x.mean(0,keepdim=True)) / (x.std(0,keepdim=True)+1e-9) 
+
+
+class MSLoss(nn.Module):
+
+    def __init__(self, *args, **kwargs) -> None:
+        super().__init__()
+
+    @torch.no_grad()
+    def softmax_center_teacher(self, teacher_patch_tokens, teacher_temp):
+        #self.apply_center_update()
+        # teacher centering and sharpening
+        #
+        # WARNING:
+        #   as self.center is a float32, everything gets casted to float32 afterwards
+        #
+        # teacher_patch_tokens = teacher_patch_tokens.float()
+        # return F.softmax((teacher_patch_tokens.sub_(self.center.to(teacher_patch_tokens.dtype))).mul_(1 / teacher_temp), dim=-1)
+
+        return teacher_patch_tokens
+
+    @torch.no_grad()
+    def sinkhorn_knopp_teacher(self, teacher_output, teacher_temp, n_masked_patches_tensor, n_iterations=3):
+        
+        return teacher_output
+    
+    @torch.no_grad()
+    def update_center(self, teacher_patch_tokens):
+        pass
+
+    
+    def forward_masked(
+        self,
+        student_patch_tokens_masked,
+        teacher_patch_tokens_masked,
+        student_masks_flat,
+        n_masked_patches=None,
+        masks_weight=None,
+    ):
+        t = teacher_patch_tokens_masked
+        s = student_patch_tokens_masked
+        t = t.squeeze(0)
+        # loss = torch.sum(t * F.log_softmax(s / self.student_temp, dim=-1), dim=-1)
+        # bn centering
+        # t = bn(t)
+        # s = bn(s)
+        # normalize
+        t = F.normalize(t+1e-1,dim=-1)
+        s = F.normalize(s,dim=-1)
+        loss = ((t-s)**2).sum(-1)
+        # assert not torch.isnan(loss.sum())
+        # if masks_weight is None:
+        #     masks_weight = (
+        #         (1 / student_masks_flat.sum(-1).clamp(min=1.0))
+        #         .unsqueeze(-1)
+        #         .expand_as(student_masks_flat)[student_masks_flat]
+        #     )
+        # if n_masked_patches is not None:
+        #     loss = loss[:n_masked_patches]
+        #loss = loss * masks_weight
+        return loss.mean()

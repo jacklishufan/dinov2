@@ -12,3 +12,4 @@ dist/
 
 .vscode/
 output_dir*
+wandb

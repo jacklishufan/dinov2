@@ -57,3 +57,22 @@ def _build_mlp(nlayers, in_dim, bottleneck_dim, hidden_dim=None, use_bn=False, b
             layers.append(nn.GELU())
         layers.append(nn.Linear(hidden_dim, bottleneck_dim, bias=bias))
         return nn.Sequential(*layers)
+
+def bn(x):
+    return (x-x.mean(0,keepdim=True)) / (x.std(0,keepdim=True)+1e-9) 
+
+class MLPR2O(nn.Module):
+    def __init__(self, input_dim, hidden_dim, output_dim):
+        super().__init__()
+
+        self.l1 = nn.Linear(input_dim, hidden_dim)
+        self.relu1 = nn.ReLU(inplace=True)
+        self.l2 = nn.Linear(hidden_dim, output_dim)
+
+    def forward(self, x):
+        x = self.l1(x)
+        assert len(x.shape) == 2
+        x = bn(x)
+        x = self.relu1(x)
+        x = self.l2(x)
+        return x

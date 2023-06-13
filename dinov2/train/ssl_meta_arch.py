@@ -10,9 +10,9 @@ import logging
 import torch
 from torch import nn
 
-from dinov2.loss import DINOLoss, iBOTPatchLoss, KoLeoLoss
+from dinov2.loss import DINOLoss, iBOTPatchLoss, KoLeoLoss,MSLoss
 from dinov2.models import build_model_from_cfg
-from dinov2.layers import DINOHead
+from dinov2.layers import DINOHead,MLPR2O
 from dinov2.utils.utils import has_batchnorms
 from dinov2.utils.param_groups import get_params_groups_with_decay, fuse_params_groups
 from dinov2.fsdp import get_fsdp_wrapper, ShardedGradScaler, get_fsdp_modules, reshard_fsdp_model
@@ -26,8 +26,8 @@ try:
 except ImportError:
     XFORMERS_AVAILABLE = False
 assert XFORMERS_AVAILABLE, "xFormers is required for DINOv2 training"
-
-
+import wandb
+from dinov2.logging.wandb import wandb_dump_img
 logger = logging.getLogger("dinov2")
 
 
@@ -90,11 +90,11 @@ class SSLMetaArch(nn.Module):
         logger.info(f"OPTIONS -- IBOT -- loss_weight: {cfg.ibot.loss_weight}")
         logger.info(f"OPTIONS -- IBOT masking -- ibot_mask_ratio_tuple: {cfg.ibot.mask_ratio_min_max}")
         logger.info(f"OPTIONS -- IBOT masking -- ibot_mask_sample_probability: {cfg.ibot.mask_sample_probability}")
+        self.ibot_out_dim = cfg.ibot.head_n_prototypes if self.ibot_separate_head else cfg.dino.head_n_prototypes
         if self.do_ibot:
             self.ibot_loss_weight = cfg.ibot.loss_weight
             assert max(cfg.ibot.mask_ratio_min_max) > 0, "please provide a positive mask ratio tuple for ibot"
             assert cfg.ibot.mask_sample_probability > 0, "please provide a positive mask probability for ibot"
-            self.ibot_out_dim = cfg.ibot.head_n_prototypes if self.ibot_separate_head else cfg.dino.head_n_prototypes
             self.ibot_patch_loss = iBOTPatchLoss(self.ibot_out_dim)
             if self.ibot_separate_head:
                 logger.info(f"OPTIONS -- IBOT -- loss_weight: {cfg.ibot.loss_weight}")
@@ -115,20 +115,34 @@ class SSLMetaArch(nn.Module):
                 logger.info("OPTIONS -- IBOT -- head shared with DINO")
         if self.do_multiscale:
             self.multiscale_loss_weight = cfg.multiscale.loss_weight
-            self.multiscale_loss = iBOTPatchLoss(self.ibot_out_dim)
+            self.multiscale_loss = MSLoss(self.ibot_out_dim)
             self.multiscale_separate_head = cfg.multiscale.separate_head
+            self.ms_debug = cfg.multiscale.debug_wandb
+            if cfg.multiscale.predictor.enabled:
+                predictor = MLPR2O(cfg.multiscale.head_n_prototypes,cfg.multiscale.predictor.hidden_size,cfg.multiscale.head_n_prototypes)
+            else:
+                predictor = nn.Identity()
+            student_model_dict["predictor"] = predictor
             if self.multiscale_separate_head:
-                logger.info(f"OPTIONS -- MS -- loss_weight: {cfg.ibot.loss_weight}")
-                logger.info(f"OPTIONS -- MS -- head_n_prototypes: {cfg.ibot.head_n_prototypes}")
-                logger.info(f"OPTIONS -- MS -- head_bottleneck_dim: {cfg.ibot.head_bottleneck_dim}")
-                logger.info(f"OPTIONS -- MS -- head_hidden_dim: {cfg.ibot.head_hidden_dim}")
+                logger.info(f"OPTIONS -- MS -- loss_weight: {cfg.multiscale.loss_weight}")
+                logger.info(f"OPTIONS -- MS -- head_n_prototypes: {cfg.multiscale.head_n_prototypes}")
+                logger.info(f"OPTIONS -- MS -- head_bottleneck_dim: {cfg.multiscale.head_bottleneck_dim}")
+                logger.info(f"OPTIONS -- MS -- head_hidden_dim: {cfg.multiscale.head_hidden_dim}")
+                # ms_head = partial(
+                #     DINOHead,
+                #     in_dim=embed_dim,
+                #     out_dim=cfg.multiscale.head_n_prototypes,
+                #     hidden_dim=cfg.multiscale.head_hidden_dim,
+                #     bottleneck_dim=cfg.multiscale.head_bottleneck_dim,
+                #     nlayers=cfg.multiscale.head_nlayers,
+                # )
                 ms_head = partial(
-                    DINOHead,
-                    in_dim=embed_dim,
-                    out_dim=cfg.multiscale.head_n_prototypes,
+                    MLPR2O,
+                    input_dim=embed_dim,
+                    output_dim=cfg.multiscale.head_n_prototypes,
                     hidden_dim=cfg.multiscale.head_hidden_dim,
-                    bottleneck_dim=cfg.multiscale.head_bottleneck_dim,
-                    nlayers=cfg.multiscale.head_nlayers,
+                    # bottleneck_dim=cfg.multiscale.head_bottleneck_dim,
+                    # nlayers=cfg.multiscale.head_nlayers,
                 )
                 student_model_dict["ms_head"] = ms_head()
                 teacher_model_dict["ms_head"] = ms_head()
@@ -160,7 +174,7 @@ class SSLMetaArch(nn.Module):
         '''
         return torch.einsum('nld,nlm->nmd',src,msk)
 
-    def forward_backward(self, images, teacher_temp):
+    def forward_backward(self, images, teacher_temp,log_img=False):
         n_global_crops = 2
         assert n_global_crops == 2
         n_local_crops = self.cfg.crops.local_crops_number
@@ -175,7 +189,7 @@ class SSLMetaArch(nn.Module):
             # mask select
             ms_msk_areas_indicator = (gloabal_crops_msk_area > 0).chunk(2)
             ms_msk_areas_indicator = ms_msk_areas_indicator[0] * ms_msk_areas_indicator[1]
-            ms_msk_areas_indicator *= torch.rand_like(ms_msk_areas_indicator.half()) < self.cfg.multiscale.sample_ratio
+            # ms_msk_areas_indicator *= torch.rand_like(ms_msk_areas_indicator.half()) < self.cfg.multiscale.sample_ratio
             ms_msk_areas_indicator = ms_msk_areas_indicator.repeat(2,1,1)
         local_crops = images["collated_local_crops"].cuda(non_blocking=True)
 
@@ -205,6 +219,7 @@ class SSLMetaArch(nn.Module):
             # watch out: these are chunked and cat'd in reverse so A is matched to B in the global crops dino loss
             teacher_cls_tokens = torch.cat((teacher_cls_tokens[1], teacher_cls_tokens[0]))
             ibot_teacher_patch_tokens = teacher_backbone_output_dict["x_norm_patchtokens"]
+
             _dim = ibot_teacher_patch_tokens.shape[-1]
             n_cls_tokens = teacher_cls_tokens.shape[0]
             if do_ibot and not self.ibot_separate_head:
@@ -244,6 +259,22 @@ class SSLMetaArch(nn.Module):
                 multi_scale_teacher = self.mask_pool(ibot_teacher_patch_tokens,global_crops_msk_one_hot.to(ibot_teacher_patch_tokens.dtype))
                 multi_scale_teacher = multi_scale_teacher.chunk(n_global_crops_teacher)
                 multi_scale_teacher = torch.cat([multi_scale_teacher[1],multi_scale_teacher[0]])
+                if self.ms_debug and log_img:
+                    bs =  multi_scale_teacher.shape[0] // 2
+                    dd = x.shape[-1]
+                    view_x = x.permute(0,2,3,1)
+                    IMAGENET_DEFAULT_MEAN = (0.485, 0.456, 0.406)
+                    IMAGENET_DEFAULT_STD = (0.229, 0.224, 0.225)
+                    ms_view1 = view_x[0].cpu().numpy() * IMAGENET_DEFAULT_STD + IMAGENET_DEFAULT_MEAN
+                    ms_view2 = view_x[bs].cpu().numpy()* IMAGENET_DEFAULT_STD + IMAGENET_DEFAULT_MEAN
+                    wandb_dump_img([ms_view1.clip(0,1),ms_view2.clip(0,1)],"img")
+                # LOGGGING
+                if self.ms_debug and log_img:
+                    bs =  multi_scale_teacher.shape[0] // 2
+                    dd = self.cfg.crops.spatial_dims[0]
+                    ms_view1 = multi_scale_teacher[0][:dd**2].view(dd,dd,-1).cpu().numpy()[...,0]
+                    ms_view2 = multi_scale_teacher[bs][:dd**2].view(dd,dd,-1).cpu().numpy()[...,0]
+                    wandb_dump_img([ms_view1,ms_view2],"ms_teacher")
                 _dim = multi_scale_teacher.shape[-1]
                 multi_scale_teacher = multi_scale_teacher.reshape(-1,_dim)[ms_msk_areas_indicator.view(-1)]
                 if self.multiscale_separate_head:
@@ -286,7 +317,6 @@ class SSLMetaArch(nn.Module):
                     )
             else:
                 raise NotImplementedError
-
             return teacher_dino_softmaxed_centered_list, masked_teacher_ibot_softmaxed_centered,multiscale_teacher_softmaxed_centered
 
         teacher_dino_softmaxed_centered_list, masked_teacher_ibot_softmaxed_centered,multiscale_teacher_softmaxed_centered = get_teacher_output()
@@ -328,9 +358,20 @@ class SSLMetaArch(nn.Module):
             ibot_student_patch_tokens = student_global_backbone_output_dict["x_norm_patchtokens"]
             multi_scale_student = self.mask_pool(ibot_student_patch_tokens,global_crops_msk_one_hot)
             _dim = multi_scale_student.shape[-1]
+            if self.ms_debug and log_img:
+                    bs =  multi_scale_student.shape[0] // 2
+                    dd = self.cfg.crops.spatial_dims[0]
+                    ms_view1 = multi_scale_student[0][:dd**2].view(dd,dd,-1).detach().cpu().numpy()[...,0]
+                    ms_view2 = multi_scale_student[bs][:dd**2].view(dd,dd,-1).detach().cpu().numpy()[...,0]
+                    wandb_dump_img([ms_view1,ms_view2],"ms_student")
+                    indicator_view1 = ms_msk_areas_indicator[0,0][:dd**2].view(dd,dd).detach().cpu().numpy()
+                    indicator_view2 = ms_msk_areas_indicator[bs,0][:dd**2].view(dd,dd).detach().cpu().numpy()
+                    wandb_dump_img([ms_view1,ms_view2],"ms_student")
+                    wandb_dump_img([indicator_view1,indicator_view2],"indicator")
             multi_scale_student = multi_scale_student.reshape(-1,_dim)[ms_msk_areas_indicator.view(-1)]
             if self.multiscale_separate_head:
                 multi_scale_student_after_head = self.student.ms_head(multi_scale_student)
+                multi_scale_student_after_head = self.student.predictor(multi_scale_student_after_head)
             else:
                 inputs_for_student_head_list.append(multi_scale_student.unsqueeze(0))
 
@@ -347,8 +388,9 @@ class SSLMetaArch(nn.Module):
         # 3c: global crops patch tokens
         if do_ibot and not self.ibot_separate_head:
             student_global_masked_patch_tokens_after_head = outputs_list.pop(0).squeeze(0)[:n_masked_patches]
-        if self.do_multiscale:
+        if self.do_multiscale and not self.multiscale_separate_head:
             multi_scale_student_after_head = outputs_list.pop(0).squeeze(0)
+            multi_scale_student_after_head = self.student.predictor(multi_scale_student_after_head)
         if n_local_crops > 0:
             dino_local_crops_loss = self.dino_loss(
                 student_output_list=student_local_cls_tokens_after_head.chunk(n_local_crops),
@@ -395,6 +437,12 @@ class SSLMetaArch(nn.Module):
 
         if do_ibot:
             # compute loss
+            if torch.isnan(student_global_masked_patch_tokens_after_head.sum()):
+                print("student_global_masked_patch_tokens_after_head",
+                      student_global_masked_patch_tokens_after_head)
+            if torch.isnan(masked_teacher_ibot_softmaxed_centered.sum()):
+                print("masked_teacher_ibot_softmaxed_centered",
+                      masked_teacher_ibot_softmaxed_centered)
             ibot_patch_loss = (
                 self.ibot_patch_loss.forward_masked(
                     student_global_masked_patch_tokens_after_head,
@@ -417,6 +465,24 @@ class SSLMetaArch(nn.Module):
             ms_mask_weight = 0.5 / (ms_msk_areas_indicator.sum(-1)+1e-3)
             ms_mask_weight = ms_mask_weight.repeat(1,ms_msk_areas_indicator.shape[-1])
             ms_mask_weight = ms_mask_weight.view(-1)[ms_msk_areas_indicator.view(-1)]
+            if torch.isnan(multi_scale_student_after_head.sum()):
+                print("HERE")
+                print(multi_scale_student_after_head)
+                print(multi_scale_student_after_head.shape)
+                print(multi_scale_student)
+                print(multi_scale_student.shape)
+                print(ms_msk_areas_indicator.sum(),multi_scale_student.shape)
+            if wandb.run is not None and self.ms_debug:
+                wandb.log(
+                    dict(
+                        student_max = multi_scale_student_after_head.max().item(),
+                        student_min = multi_scale_student_after_head.min().item(),
+                        patch_max = ibot_student_patch_tokens.max().item(),
+                        patch_min = ibot_student_patch_tokens.min().item(),
+                        teacher_max = multiscale_teacher_softmaxed_centered.max().item(),
+                        teacher_min = multiscale_teacher_softmaxed_centered.min().item(),
+                    )
+                )
             ms_patch_loss = (
                 self.multiscale_loss.forward_masked(
                     multi_scale_student_after_head,
@@ -453,9 +519,10 @@ class SSLMetaArch(nn.Module):
         teacher_param_list = []
         with torch.no_grad():
             for k in self.student.keys():
-                for ms, mt in zip(get_fsdp_modules(self.student[k]), get_fsdp_modules(self.teacher[k])):
-                    student_param_list += ms.params
-                    teacher_param_list += mt.params
+                if k not in 'predictor':              
+                    for ms, mt in zip(get_fsdp_modules(self.student[k]), get_fsdp_modules(self.teacher[k])):
+                        student_param_list += ms.params
+                        teacher_param_list += mt.params
             torch._foreach_mul_(teacher_param_list, m)
             torch._foreach_add_(teacher_param_list, student_param_list, alpha=1 - m)
 
@@ -488,8 +555,10 @@ class SSLMetaArch(nn.Module):
             raise NotImplementedError
         # below will synchronize all student subnetworks across gpus:
         for k, v in self.student.items():
-            self.teacher[k].load_state_dict(self.student[k].state_dict())
+            if k not in ['predictor']:
+                self.teacher[k].load_state_dict(self.student[k].state_dict()) 
             student_model_cfg = self.cfg.compute_precision.student[k]
             self.student[k] = get_fsdp_wrapper(student_model_cfg, modules_to_wrap={BlockChunk})(self.student[k])
-            teacher_model_cfg = self.cfg.compute_precision.teacher[k]
-            self.teacher[k] = get_fsdp_wrapper(teacher_model_cfg, modules_to_wrap={BlockChunk})(self.teacher[k])
+            if k not in ['predictor']:
+                teacher_model_cfg = self.cfg.compute_precision.teacher[k]
+                self.teacher[k] = get_fsdp_wrapper(teacher_model_cfg, modules_to_wrap={BlockChunk})(self.teacher[k])

@@ -13,7 +13,7 @@ import time
 import torch
 
 import dinov2.distributed as distributed
-
+import wandb
 
 logger = logging.getLogger("dinov2")
 
@@ -99,6 +99,9 @@ class MetricLogger(object):
                 self.dump_in_output_file(iteration=i, iter_time=iter_time.avg, data_time=data_time.avg)
                 eta_seconds = iter_time.global_avg * (n_iterations - i)
                 eta_string = str(datetime.timedelta(seconds=int(eta_seconds)))
+                if wandb.run is not None:
+                    wandb.log(dict([(k,float(str(v).split('(')[0]
+                                             )) for (k,v) in self.meters.items()]))
                 if torch.cuda.is_available():
                     logger.info(
                         log_msg.format(

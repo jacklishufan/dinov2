@@ -4,11 +4,15 @@ student:
   block_chunks: 4
 train:
   dataset_path: ImageNet:split=TRAIN
-  batch_size_per_gpu: 256
+  batch_size_per_gpu: 128
 crops:
   local_crops_size: 98
 optim:
-  epochs: 100
+  epochs: 200
 multiscale:
   loss_weight: 1.0
-  
+  separate_head: true
+  head_n_prototypes: 2048
+  debug_wandb: on
+ibot:
+  loss_weight: 1.0
