@@ -9,10 +9,15 @@ crops:
   local_crops_size: 98
 optim:
   epochs: 200
+  base_lr: 0.0004  # learning rate for a batch size of 1024
+  warmup_epochs: 1
 multiscale:
   loss_weight: 1.0
   separate_head: true
-  head_n_prototypes: 2048
+  head_n_prototypes: 256
   debug_wandb: on
+  predictor:
+    enabled: on
+    hidden_size: 4096
 ibot:
-  loss_weight: 1.0
+  loss_weight: 0.0

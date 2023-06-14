@@ -142,5 +142,5 @@ multiscale:
   head_hidden_dim: 2048
   debug_wandb: off
   predictor:
-    enabled: on
+    enabled: off
     hidden_size: 4096

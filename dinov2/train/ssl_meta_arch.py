@@ -119,7 +119,7 @@ class SSLMetaArch(nn.Module):
             self.multiscale_separate_head = cfg.multiscale.separate_head
             self.ms_debug = cfg.multiscale.debug_wandb
             if cfg.multiscale.predictor.enabled:
-                predictor = MLPR2O(cfg.multiscale.head_n_prototypes,cfg.multiscale.predictor.hidden_size,cfg.multiscale.head_n_prototypes)
+                predictor = MLPR2O(cfg.multiscale.head_n_prototypes,cfg.multiscale.predictor.hidden_size,cfg.multiscale.head_n_prototypes,pre_norm=False)
             else:
                 predictor = nn.Identity()
             student_model_dict["predictor"] = predictor
@@ -276,10 +276,10 @@ class SSLMetaArch(nn.Module):
                     ms_view2 = multi_scale_teacher[bs][:dd**2].view(dd,dd,-1).cpu().numpy()[...,0]
                     wandb_dump_img([ms_view1,ms_view2],"ms_teacher")
                 _dim = multi_scale_teacher.shape[-1]
-                multi_scale_teacher = multi_scale_teacher.reshape(-1,_dim)[ms_msk_areas_indicator.view(-1)]
                 if self.multiscale_separate_head:
                     multi_scale_teacher = self.teacher.ms_head(multi_scale_teacher)
                 else:
+                    multi_scale_teacher = multi_scale_teacher.reshape(-1,_dim)#[ms_msk_areas_indicator.view(-1)]
                     multi_scale_teacher = self.teacher.dino_head(multi_scale_teacher)
             if self.cfg.train.centering == "centering":
                 teacher_dino_softmaxed_centered_list = self.dino_loss.softmax_center_teacher(
@@ -368,13 +368,22 @@ class SSLMetaArch(nn.Module):
                     indicator_view2 = ms_msk_areas_indicator[bs,0][:dd**2].view(dd,dd).detach().cpu().numpy()
                     wandb_dump_img([ms_view1,ms_view2],"ms_student")
                     wandb_dump_img([indicator_view1,indicator_view2],"indicator")
-            multi_scale_student = multi_scale_student.reshape(-1,_dim)[ms_msk_areas_indicator.view(-1)]
+            
             if self.multiscale_separate_head:
                 multi_scale_student_after_head = self.student.ms_head(multi_scale_student)
                 multi_scale_student_after_head = self.student.predictor(multi_scale_student_after_head)
             else:
+                multi_scale_student = multi_scale_student.reshape(-1,_dim)#[ms_msk_areas_indicator.view(-1)]
                 inputs_for_student_head_list.append(multi_scale_student.unsqueeze(0))
-
+            if self.ms_debug and log_img:
+                bs =  multi_scale_student_after_head.shape[0] // 2
+                dd = self.cfg.crops.spatial_dims[0]
+                ms_view1 = multi_scale_student_after_head[0][:dd**2].view(dd,dd,-1).detach().cpu().numpy()[...,0]
+                ms_view2 = multi_scale_student_after_head[bs][:dd**2].view(dd,dd,-1).detach().cpu().numpy()[...,0]
+                wandb_dump_img([ms_view1,ms_view2],"student_after_head")
+                ms_view1 = multiscale_teacher_softmaxed_centered[0][0][:dd**2].view(dd,dd,-1).detach().cpu().numpy()[...,0]
+                ms_view2 = multiscale_teacher_softmaxed_centered[0][bs][:dd**2].view(dd,dd,-1).detach().cpu().numpy()[...,0]
+                wandb_dump_img([ms_view1,ms_view2],"teacher_after_head")
         # 2: run
         _attn_bias, cat_inputs = fmha.BlockDiagonalMask.from_tensor_list(inputs_for_student_head_list)
         outputs_list = _attn_bias.split(self.student.dino_head(cat_inputs))
@@ -489,7 +498,7 @@ class SSLMetaArch(nn.Module):
                     multiscale_teacher_softmaxed_centered,
                     student_masks_flat=torch.ones_like(masks),
                     n_masked_patches=multi_scale_student_after_head.shape[0],
-                    masks_weight=ms_mask_weight,
+                    masks_weight=ms_msk_areas_indicator,
                 )
                 * loss_scales
                 * ms_loss_scale

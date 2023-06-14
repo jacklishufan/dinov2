@@ -8,7 +8,7 @@ import torch
 import torch.nn as nn
 from torch.nn.init import trunc_normal_
 from torch.nn.utils import weight_norm
-
+from torch.nn.modules._functions import SyncBatchNorm as sync_batch_norm
 
 class DINOHead(nn.Module):
     def __init__(
@@ -58,20 +58,52 @@ def _build_mlp(nlayers, in_dim, bottleneck_dim, hidden_dim=None, use_bn=False, b
         layers.append(nn.Linear(hidden_dim, bottleneck_dim, bias=bias))
         return nn.Sequential(*layers)
 
+import torch.distributed as dist
+
 def bn(x):
-    return (x-x.mean(0,keepdim=True)) / (x.std(0,keepdim=True)+1e-9) 
+    old_shape = x.shape
+    d_emb = x.shape[-1]
+    dtype = x.dtype
+
+    x = x.float() # force fp32
+    x = x.view(-1,d_emb)
+    running_mean = torch.zeros(d_emb,dtype=torch.float32).to(x.device)
+    running_std = torch.ones(d_emb,dtype=torch.float32).to(x.device)
+    x = sync_batch_norm.apply(
+         x,
+        None,
+        None,
+        running_mean,
+        running_std,
+        1e-05,
+        0.0,
+        dist.group.WORLD,
+        dist.get_world_size(),
+    )
+    x = x.view(*old_shape)
+    x = x.to(dtype)
+    # x_mean_local = x.mean(0,keepdim=True)
+    # x_mean = x_mean_local.detach()
+    # dist.all_reduce(x_mean) 
+    # x_mean /= dist.get_world_size()
+
+    # x_var_local = ((x - x_mean) **2).mean()
+    # x_std = x_std.mean().detach()
+    # dist.all_reduce(x_std) 
+    # x_std /= dist.get_world_size()
+    return x
 
 class MLPR2O(nn.Module):
-    def __init__(self, input_dim, hidden_dim, output_dim):
+    def __init__(self, input_dim, hidden_dim, output_dim,pre_norm=True):
         super().__init__()
 
         self.l1 = nn.Linear(input_dim, hidden_dim)
         self.relu1 = nn.ReLU(inplace=True)
         self.l2 = nn.Linear(hidden_dim, output_dim)
-
+        self.ln1 = nn.LayerNorm(input_dim) if pre_norm else nn.Identity()
     def forward(self, x):
+        x = self.ln1(x)
         x = self.l1(x)
-        assert len(x.shape) == 2
         x = bn(x)
         x = self.relu1(x)
         x = self.l2(x)

@@ -71,6 +71,9 @@ def get_params_groups_with_decay(model, lr_decay_rate=1.0, patch_embed_lr_mult=1
         if name.endswith(".bias") or "norm" in name or "gamma" in name:
             d.update({"wd_multiplier": 0.0})
 
+        if 'ms_head' in name or 'predictor' in name:
+            d.update({"wd_multiplier": 3.0})
+
         if "patch_embed" in name:
             d.update({"lr_multiplier": d["lr_multiplier"] * patch_embed_lr_mult})
 

@@ -1,4 +1,7 @@
 # Copyright (c) Meta Platforms, Inc. and affiliates.
+
+
+
 # All rights reserved.
 #
 # This source code is licensed under the license found in the
@@ -153,7 +156,11 @@ class iBOTPatchLoss(nn.Module):
             self.updated = True
 
 def bn(x):
-    return (x-x.mean(0,keepdim=True)) / (x.std(0,keepdim=True)+1e-9) 
+    x_mean = x.mean(0,keepdim=True).detach(
+    )
+    dist.all_reduce(x_mean) 
+    x_mean /= dist.get_world_size()
+    return (x-x_mean) 
 
 
 class MSLoss(nn.Module):
@@ -197,13 +204,15 @@ class MSLoss(nn.Module):
         t = t.squeeze(0)
         # loss = torch.sum(t * F.log_softmax(s / self.student_temp, dim=-1), dim=-1)
         # bn centering
+        # r2 = (t**2).sum(-1).mean()+(s**2).sum(-1).mean()
         # t = bn(t)
         # s = bn(s)
         # normalize
-        t = F.normalize(t+1e-1,dim=-1)
+        t = F.normalize(t,dim=-1)
         s = F.normalize(s,dim=-1)
-        loss = ((t-s)**2).sum(-1)
-        # assert not torch.isnan(loss.sum())
+        inv_loss = ((t.detach()-s)**2).sum(dim=-1) * masks_weight.squeeze(1) 
+        loss = inv_loss.sum() / (1e-9+masks_weight.sum())
+        # assert not torch.isnan(loss.sum()) 
         # if masks_weight is None:
         #     masks_weight = (
         #         (1 / student_masks_flat.sum(-1).clamp(min=1.0))
@@ -213,4 +222,4 @@ class MSLoss(nn.Module):
         # if n_masked_patches is not None:
         #     loss = loss[:n_masked_patches]
         #loss = loss * masks_weight
-        return loss.mean()
+        return loss #+ 0.01*r2
