@@ -270,7 +270,7 @@ def eval_knn(
         sampler_type=SamplerType.DISTRIBUTED,
         drop_last=False,
         shuffle=False,
-        persistent_workers=True,
+        persistent_workers=False,
     )
     num_classes = train_labels.max() + 1
     metric_collection = build_topk_accuracy_metric(accuracy_averaging, num_classes=num_classes)
@@ -330,6 +330,7 @@ def eval_knn_with_model(
     num_workers=5,
     n_per_class_list=[-1],
     n_tries=1,
+    no_barrier=False
 ):
     transform = transform or make_classification_eval_transform()
 
@@ -356,7 +357,6 @@ def eval_knn_with_model(
             n_per_class_list=n_per_class_list,
             n_tries=n_tries,
         )
-
     results_dict = {}
     if distributed.is_main_process():
         for knn_ in results_dict_knn.keys():
@@ -365,14 +365,16 @@ def eval_knn_with_model(
             results_dict[f"{knn_} Top 1"] = top1
             results_dict[f"{knn_} Top 5"] = top5
             logger.info(f"{knn_} classifier result: Top1: {top1:.2f} Top5: {top5:.2f}")
+    if no_barrier:
+        pass
+    else:
+        metrics_file_path = os.path.join(output_dir, "results_eval_knn.json")
+        with open(metrics_file_path, "a") as f:
+            for k, v in results_dict.items():
+                f.write(json.dumps({k: v}) + "\n")
 
-    metrics_file_path = os.path.join(output_dir, "results_eval_knn.json")
-    with open(metrics_file_path, "a") as f:
-        for k, v in results_dict.items():
-            f.write(json.dumps({k: v}) + "\n")
-
-    if distributed.is_enabled():
-        torch.distributed.barrier()
+        if distributed.is_enabled():
+            torch.distributed.barrier()
     return results_dict
 
 

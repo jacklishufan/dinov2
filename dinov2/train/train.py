@@ -24,6 +24,7 @@ from dinov2.utils.utils import CosineScheduler
 from dinov2.train.ssl_meta_arch import SSLMetaArch
 import os
 import wandb
+from dinov2.eval.knn import eval_knn_with_model
 WANDB_ENABLED = not os.environ.get('NO_WANDB')
 
 torch.backends.cuda.matmul.allow_tf32 = True  # PyTorch 1.12 sets this to False by default
@@ -124,15 +125,23 @@ def apply_optim_scheduler(optimizer, lr, wd, last_layer_lr):
 
 def do_test(cfg, model, iteration):
     new_state_dict = model.teacher.state_dict()
-
+    iterstring = str(iteration)
+    eval_dir = os.path.join(cfg.train.output_dir, "eval", iterstring)
     if distributed.is_main_process():
-        iterstring = str(iteration)
-        eval_dir = os.path.join(cfg.train.output_dir, "eval", iterstring)
         os.makedirs(eval_dir, exist_ok=True)
         # save teacher checkpoint
         teacher_ckp_path = os.path.join(eval_dir, "teacher_checkpoint.pth")
         torch.save({"teacher": new_state_dict}, teacher_ckp_path)
-
+    if cfg.test.run_knn:
+        run_knn(cfg,model,eval_dir)
+#     --train-dataset ImageNet:split=TRAIN:root=/home/jacklishufan/imagenet/ILSVRC/in1k:extra=/home/jacklishufan/imagenet/extra \
+#    --val-dataset ImageNet:split=VAL:root=/home/jacklishufan/imagenet/ILSVRC/in1k:extra=/home/jacklishufan/imagenet/extra
+def run_knn(cfg,model,eval_dir):
+    r = eval_knn_with_model(model.teacher.backbone,eval_dir,
+                        cfg.train.dataset_path,
+                        cfg.val.dataset_path,num_workers=5,no_barrier=True)
+    if wandb.run is not None:
+        wandb.log(r)
 
 def do_train(cfg, model, resume=False):
     model.train()
